@@ -36,7 +36,21 @@ cp target/release/g-pet ~/.local/bin/
 g-pet
 ```
 
-Para ele aparecer em todo terminal novo, coloque `g-pet` no final do seu `~/.bashrc` (ou equivalente).
+Para ele aparecer em todo terminal novo, rode:
+
+```bash
+g-pet start
+```
+
+Isso acrescenta a inicialização ao `~/.bashrc` (ou ao `~/.zshrc`, se o seu shell for zsh). Se já houver uma inicialização em algum dos arquivos abaixo, ele não duplica. Se preferir fazer à mão, basta colocar `g-pet` no final do seu `~/.bashrc` (ou equivalente). Os terminais que já estão abertos não mudam: rode `g-pet` neles.
+
+Para ele parar de iniciar nos terminais novos, rode:
+
+```bash
+g-pet stop
+```
+
+Isso remove a linha que inicia o `g-pet` de `~/.bashrc`, `~/.bash_profile`, `~/.profile`, `~/.zshrc` e `~/.zprofile`. Os fantasminhas dos terminais que já estão abertos continuam rodando; use `g-pet kill` para encerrá-los.
 
 ## Como funciona
 

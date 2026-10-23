@@ -2,6 +2,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::raw::{c_int, c_ulong};
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,6 +28,11 @@ const PHRASES: &[&str] = &[
     "Eu vi um processo zumbi, juro",
     "Você salvou o arquivo?",
 ];
+// Arquivos de shell (relativos ao $HOME) onde o g-pet costuma ser iniciado.
+const RC_FILES: &[&str] = &[".bashrc", ".bash_profile", ".profile", ".zshrc", ".zprofile"];
+// Bloco que `start` acrescenta ao shell. O comentário começa com "# g-pet" para o `stop` levá-lo junto.
+const AUTOSTART: &str = "# g-pet: fantasminha na última linha do terminal (um por terminal; use `g-pet stop` para desativar)\n\
+[ -t 1 ] && command -v g-pet >/dev/null && g-pet 2>/dev/null\n";
 
 #[repr(C)]
 struct Winsize {
@@ -36,7 +42,7 @@ struct Winsize {
     ypixel: u16,
 }
 
-extern "C" {
+unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn tcgetpgrp(fd: c_int) -> c_int;
     fn getpgid(pid: c_int) -> c_int;
@@ -225,12 +231,146 @@ fn kill_all() -> usize {
     pet_pids().into_iter().filter(|&p| unsafe { kill(p, SIGTERM) } == 0).count()
 }
 
+// A linha executa o g-pet? Só conta `g-pet` na posição de comando: `command -v g-pet`,
+// aliases, PATH e comentários não são inicialização.
+fn starts_pet(line: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    !line.trim_start().starts_with('#')
+        && words.iter().enumerate().any(|(i, w)| {
+            w.trim_end_matches(';') == "g-pet"
+                && (i == 0 || matches!(words[i - 1], "&&" | "||" | ";" | "|" | "then" | "do" | "else" | "{" | "("))
+        })
+}
+
+// Tira as linhas que iniciam o g-pet, junto do comentário "# g-pet..." logo acima delas
+// (e da linha em branco que o `start` deixa antes do comentário).
+// Devolve o novo texto e quantas linhas saíram.
+fn strip_autostart(text: &str) -> (String, usize) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut removed = 0;
+    for line in text.lines() {
+        if starts_pet(line) {
+            if kept.last().map_or(false, |l| l.trim_start().starts_with("# g-pet")) {
+                kept.pop();
+                if kept.last().map_or(false, |l| l.trim().is_empty()) {
+                    kept.pop();
+                }
+            }
+            removed += 1;
+        } else {
+            kept.push(line);
+        }
+    }
+    let mut out = kept.join("\n");
+    if text.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    (out, removed)
+}
+
+fn home_dir() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(h) => PathBuf::from(h),
+        None => {
+            eprintln!("g-pet: $HOME não definido");
+            std::process::exit(1);
+        }
+    }
+}
+
+// Faz o g-pet subir em todo terminal novo: acrescenta AUTOSTART ao .bashrc (ou ao .zshrc, se o
+// shell for zsh). Não duplica se já houver inicialização e não mexe nos terminais já abertos.
+fn start() {
+    let home = home_dir();
+    for name in RC_FILES {
+        let path = home.join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(t) if t.lines().any(starts_pet) => {
+                println!("g-pet: já inicia nos terminais novos ({})", path.display());
+                return;
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                eprintln!("g-pet: não foi possível ler {}: {}", path.display(), e);
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    }
+    let zsh = std::env::var("SHELL").map_or(false, |s| s.ends_with("zsh"));
+    let path = home.join(if zsh { ".zshrc" } else { ".bashrc" });
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut block = String::new();
+    if !text.is_empty() {
+        if !text.ends_with('\n') {
+            block.push('\n');
+        }
+        block.push('\n');
+    }
+    block.push_str(AUTOSTART);
+    let written = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(block.as_bytes()));
+    match written {
+        Ok(()) => {
+            println!("g-pet: adicionado a {}", path.display());
+            println!("g-pet: terminais novos vão iniciar o g-pet (os já abertos não mudam: rode `g-pet` neles)");
+        }
+        Err(e) => {
+            eprintln!("g-pet: não foi possível escrever em {}: {}", path.display(), e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// Impede o g-pet de subir em terminais novos. Não encerra os que já estão rodando (use `kill`).
+fn stop() {
+    let home = home_dir();
+    let mut removed = 0;
+    for name in RC_FILES {
+        let path = home.join(name);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                eprintln!("g-pet: não foi possível ler {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        let (new_text, n) = strip_autostart(&text);
+        if n == 0 {
+            continue;
+        }
+        match std::fs::write(&path, new_text) {
+            Ok(()) => {
+                println!("g-pet: removido de {}", path.display());
+                removed += n;
+            }
+            Err(e) => eprintln!("g-pet: não foi possível escrever em {}: {}", path.display(), e),
+        }
+    }
+    if removed == 0 {
+        println!("g-pet: nenhuma inicialização encontrada ({})", RC_FILES.join(", "));
+    } else {
+        println!("g-pet: terminais novos não vão mais iniciar o g-pet (os já abertos continuam: use `g-pet kill`)");
+    }
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("kill") {
         match kill_all() {
             0 => println!("g-pet: nenhum g-pet rodando"),
             n => println!("g-pet: {} encerrado(s)", n),
         }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("stop") {
+        stop();
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("start") {
+        start();
         return;
     }
 
